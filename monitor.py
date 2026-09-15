@@ -35,34 +35,58 @@ def send_telegram(text):
         print(f"[ERROR] Lỗi gửi Telegram: {e}")
         return False
 
-def get_latest_video(channel_url):
-    """Lấy 1 video mới nhất từ kênh bằng yt-dlp"""
-    cmd = [
-        'yt-dlp',
-        '--flat-playlist',
-        '--playlist-end', '1',
-        '--print', '%(id)s|%(title)s|%(url)s',
-        '--compat-options', 'no-youtube-unavailable-videos',
-        channel_url
-    ]
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=45)
-        if p.returncode == 0:
-            for line in p.stdout.splitlines():
-                line = line.strip()
-                if '|' in line and line.count('|') >= 2:
-                    parts = line.split('|', 2)
-                    v_id = parts[0].strip()
-                    v_title = parts[1].strip()
-                    v_url = parts[2].strip()
-                    if not v_url.startswith("http"):
-                        v_url = f"https://www.youtube.com/watch?v={v_id}"
-                    return {"id": v_id, "title": v_title, "url": v_url}
-        else:
-            print(f"[WARN] yt-dlp trả về mã lỗi: {p.returncode}. Stderr: {p.stderr.strip()[:100]}")
-    except Exception as e:
-        print(f"[ERROR] Lỗi quét {channel_url}: {e}")
-    return None
+def get_channel_videos(channel_url, max_per_tab=3):
+    """Quét cả tab Shorts và Videos để không bao giờ bỏ sót video hoặc short mới"""
+    clean_url = channel_url.rstrip('/')
+    urls_to_scan = []
+
+    if clean_url.endswith('/shorts') or clean_url.endswith('/videos'):
+        urls_to_scan.append(clean_url)
+    else:
+        # YouTube phân tách Shorts và Video dài ở 2 tab riêng biệt
+        urls_to_scan.append(f"{clean_url}/shorts")
+        urls_to_scan.append(f"{clean_url}/videos")
+
+    found_videos = []
+    seen_ids = set()
+
+    for target_url in urls_to_scan:
+        cmd = [
+            'yt-dlp',
+            '--flat-playlist',
+            '--playlist-end', str(max_per_tab),
+            '--print', '%(id)s|%(title)s|%(url)s',
+            '--compat-options', 'no-youtube-unavailable-videos',
+            target_url
+        ]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=40)
+            if p.returncode == 0:
+                for line in p.stdout.splitlines():
+                    line = line.strip()
+                    if '|' in line and line.count('|') >= 2:
+                        parts = line.split('|', 2)
+                        v_id = parts[0].strip()
+                        v_title = parts[1].strip()
+                        v_url = parts[2].strip()
+
+                        if v_id and len(v_id) > 2 and "WARNING" not in v_id and v_id not in seen_ids:
+                            seen_ids.add(v_id)
+                            if not v_url.startswith("http"):
+                                if "/shorts" in target_url:
+                                    v_url = f"https://www.youtube.com/shorts/{v_id}"
+                                else:
+                                    v_url = f"https://www.youtube.com/watch?v={v_id}"
+                            found_videos.append({
+                                "id": v_id,
+                                "title": v_title,
+                                "url": v_url,
+                                "is_short": ("/shorts" in target_url or "/shorts/" in v_url)
+                            })
+        except Exception as e:
+            print(f"[ERROR] Lỗi quét URL {target_url}: {e}")
+
+    return found_videos
 
 def main():
     print(f"=== BẮT ĐẦU QUÉT YOUTUBE ({time.strftime('%Y-%m-%d %H:%M:%S')}) ===")
@@ -92,50 +116,58 @@ def main():
             continue
 
         print(f"[*] Đang quét kênh: {name} ({url})...")
-        video = get_latest_video(url)
-        if not video:
-            print(f"[WARN] Không lấy được video của {name}")
+        videos = get_channel_videos(url, max_per_tab=3)
+        if not videos:
+            print(f"[WARN] Không lấy được video nào từ {name}")
             continue
-
-        v_id = video["id"]
-        v_title = video["title"]
-        v_url = video["url"]
 
         seen_list = seen_data.get(url, [])
 
-        # Lần đầu tiên thêm kênh: Lưu mốc video hiện tại, không spam thông báo
+        # Lần đầu tiên theo dõi kênh: Ghi nhận các video hiện tại để làm mốc, không báo dồn dập
         if not seen_list:
-            print(f"[INIT] Kênh mới '{name}': Ghi nhận video mốc '{v_title}' (ID: {v_id}).")
-            seen_data[url] = [v_id]
+            top_ids = [v["id"] for v in videos]
+            print(f"[INIT] Kênh mới '{name}': Ghi nhận {len(top_ids)} video làm mốc ban đầu.")
+            seen_data[url] = top_ids
             changes_made = True
             continue
 
-        # Nếu video mới nhất chưa có trong danh sách đã xem -> Có video mới!
-        if v_id not in seen_list:
-            print(f"[FOUND] Phát hiện video mới từ '{name}': {v_title}")
-            safe_title = html.escape(v_title)
-            safe_name = html.escape(name)
+        # Kiểm tra xem có video / short mới nào không
+        new_videos_found = []
+        for v in videos:
+            if v["id"] not in seen_list:
+                new_videos_found.append(v)
 
-            msg = (
-                f"🔔 <b>[YOUTUBE MONITOR] PHÁT HIỆN VIDEO MỚI!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📺 <b>Kênh:</b> {safe_name}\n"
-                f"🎬 <b>Tiêu đề:</b> {safe_title}\n"
-                f"🔗 <b>Xem video:</b> <a href=\"{v_url}\">{v_url}</a>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━"
-            )
+        if new_videos_found:
+            for v in reversed(new_videos_found): # Gửi từ cũ hơn đến mới nhất
+                v_id = v["id"]
+                v_title = v["title"]
+                v_url = v["url"]
+                tag = "🎬 [SHORTS MỚI]" if v["is_short"] else "📹 [VIDEO MỚI]"
 
-            print(f"[NOTIFY] Đang gửi Telegram...")
-            if send_telegram(msg):
-                print(" -> Gửi thành công!")
-            else:
-                print(" -> Gửi thất bại!")
+                print(f"[FOUND] Phát hiện {tag} từ '{name}': {v_title}")
+                safe_title = html.escape(v_title)
+                safe_name = html.escape(name)
 
-            seen_data[url].append(v_id)
-            changes_made = True
-            time.sleep(1)
+                msg = (
+                    f"🔔 <b>{tag}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📺 <b>Kênh:</b> {safe_name}\n"
+                    f"📝 <b>Tiêu đề:</b> {safe_title}\n"
+                    f"🔗 <b>Xem ngay:</b> <a href=\"{v_url}\">{v_url}</a>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━"
+                )
+
+                print(f"[NOTIFY] Đang gửi Telegram...")
+                if send_telegram(msg):
+                    print(" -> Gửi thành công!")
+                else:
+                    print(" -> Gửi thất bại!")
+
+                seen_data[url].append(v_id)
+                changes_made = True
+                time.sleep(1)
         else:
-            print(f"[OK] '{name}' chưa có video mới.")
+            print(f"[OK] '{name}' chưa có video hay Shorts mới.")
 
     if changes_made:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:

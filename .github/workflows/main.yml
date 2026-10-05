@@ -2,13 +2,17 @@ name: YouTube Channel Monitor
 
 on:
   schedule:
-    # Tự động quét mỗi 5 phút một lần
     - cron: '*/5 * * * *'
-  workflow_dispatch: # Cho phép bấm nút chạy thử bất kỳ lúc nào
+  workflow_dispatch:
+
+concurrency:
+  group: youtube-channel-monitor
+  cancel-in-progress: true
 
 jobs:
   check-channels:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: write
 
